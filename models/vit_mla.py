@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.components import PatchEmbedding, MLA, DeepseekConfig
+from components import PatchEmbedding, MLA, MLAConfig
 
 class ViT_MLA(nn.Module):
     def __init__(self, num_classes=100):
@@ -10,7 +10,7 @@ class ViT_MLA(nn.Module):
         self.embed = PatchEmbedding(in_channels=3, patch_size=4, embed_dim=384)
 
         # Configure MLA (no RoPE in this version)
-        config = DeepseekConfig(
+        config = MLAConfig(
             hidden_size=384,
             num_heads=6,
             max_position_embeddings=1024,
