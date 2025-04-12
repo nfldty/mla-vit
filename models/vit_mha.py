@@ -9,7 +9,6 @@ class ViT_MHA(nn.Module):
         self.patch_dim = 3 * patch_size * patch_size
         self.linear_embedding = nn.Linear(self.patch_dim, embed_dim)
         self.position_embedding = nn.Parameter(torch.randn(1, self.num_patches, embed_dim))
-
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=768, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 

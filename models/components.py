@@ -3,115 +3,254 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-# Patch embedding: converts image to patch tokens
+
 class PatchEmbedding(nn.Module):
     def __init__(self, in_channels=3, patch_size=4, embed_dim=768, img_size=32):
-        super().__init__()
+        super(PatchEmbedding, self).__init__()
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        # Calculate number of patches in the image
         self.num_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        # Convolution layer to split image and map each patch to an embedding vector
+        self.conv = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
-        x = self.proj(x)                  # (B, C, H, W) -> (B, embed_dim, H/patch, W/patch)
-        x = x.flatten(2).transpose(1, 2)  # -> (B, num_patches, embed_dim)
-        return x
+        x = self.conv(x)
+        x = x.flatten(2)  # Flatten to shape (batch_size, embed_dim, num_patches^2)
+        # Transpose to (batch_size, num_patches^2, embed_dim)
+        x = x.transpose(1, 2)
+        return x  # Final shape: (batch_size, num_patches^2, embed_dim)
 
-# RMS LayerNorm
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
+        self.variance_epsilon = eps
 
-    def forward(self, x):
-        var = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        x_normed = x * torch.rsqrt(var + self.eps)
-        return self.weight * x_normed.to(x.dtype)
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
-# Rotary positional embedding
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=1000, device=None):
         super().__init__()
         self.dim = dim
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (
+                self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(max_position_embeddings, dtype=torch.get_default_dtype())
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
+        )
+        self.max_seq_len_cached = None
 
-    def _set_cos_sin_cache(self, seq_len, dtype):
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+        )
+        freqs = torch.outer(t, self.inv_freq.to(t.device))
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
     def forward(self, x, seq_len=None):
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
 
 def rotate_half(x):
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-    return torch.cat([-x2, x1], dim=-1)
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]  # Take first half
+    x2 = x[..., x.shape[-1] // 2:]   # Take second half
+    return torch.cat((-x2, x1), dim=-1)  # Swap and concatenate
 
-def apply_rotary_pos_emb(q, k, cos, sin, pos_ids):
-    cos = cos[pos_ids].unsqueeze(1)
-    sin = sin[pos_ids].unsqueeze(1)
-    q = q.view(*q.shape[:-1], -1, 2).transpose(-1, -2).reshape(q.shape)
-    k = k.view(*k.shape[:-1], -1, 2).transpose(-1, -2).reshape(k.shape)
-    return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)  # Extract corresponding cos values and expand dims
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)  # Extract corresponding sin values and expand dims
 
-# Config class for MLA
+    # Process q by splitting into two parts then rotating
+    b, h, s, d = q.shape  # Get q shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)  # Split and rearrange
+
+    # Similar processing for k
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)  # Split and rearrange
+
+    # Apply rotary position encoding
+    q_embed = (q * cos) + (rotate_half(q) * sin)  # Query vector rotary position encoding
+    k_embed = (k * cos) + (rotate_half(k) * sin)  # Key vector rotary position encoding
+
+    return q_embed, k_embed
+
 class MLAConfig:
-    def __init__(self):
-        self.hidden_size = 768
-        self.num_heads = 6
-        self.max_position_embeddings = 1024
-        self.rope_theta = 1280
-        self.attention_dropout = 0
-        self.q_lora_rank = 1536
-        self.qk_rope_head_dim = 64
-        self.kv_lora_rank = 512
-        self.v_head_dim = 128
-        self.qk_nope_head_dim = 128
-        self.attention_bias = False
 
-# MLA + RoPE attention module
+    def __init__(self, hidden_size, num_heads, max_position_embeddings, rope_theta, attention_dropout, 
+                 q_lora_rank, qk_rope_head_dim, kv_lora_rank, v_head_dim, qk_nope_head_dim, attention_bias):
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.max_position_embeddings = max_position_embeddings
+        self.rope_theta = rope_theta
+        self.attention_dropout = attention_dropout
+        self.q_lora_rank = q_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.kv_lora_rank = kv_lora_rank
+        self.v_head_dim = v_head_dim
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.attention_bias = attention_bias
+
 class MLA(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.q_lora_rank = config.q_lora_rank
+        # Dimensions for query and key rope application
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        # For value compression vectors
+        self.kv_lora_rank = config.kv_lora_rank
+        # Dimension size for each head
+        self.v_head_dim = config.v_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        
+        self.q_down_proj = nn.Linear(
+            self.hidden_size,
+            self.q_lora_rank,
+            bias=config.attention_bias,
+        )
+        self.q_down_layernorm = RMSNorm(self.q_lora_rank)
+        self.q_up_proj = nn.Linear(
+            self.q_lora_rank,
+            self.num_heads * self.q_head_dim,
+            # Final output needs splitting - part for nope, part for rope application
+            bias=False,
+        )
+        
+        # Similarly for kv
+        self.kv_down_proj = nn.Linear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=config.attention_bias,
+        )
+        self.kv_down_layernorm = RMSNorm(self.kv_lora_rank)
+        self.kv_up_proj = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads * (
+                    self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim
+            ), 
+            bias=False,
+        )
+        
+        self.o_proj = nn.Linear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=config.attention_bias,
+        )
+        
+        # Initialize rope parameters
+        self.rotary_emb = RotaryEmbedding(
+            self.qk_rope_head_dim,
+            self.max_position_embeddings,
+            self.rope_theta,
+        )
 
-        self.q_down = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-        self.q_norm = RMSNorm(config.q_lora_rank)
-        self.q_up = nn.Linear(config.q_lora_rank, config.num_heads * self.q_head_dim, bias=False)
+    def forward(self, hidden_states, attention_mask=None, position_ids=None):
+        """
+        MLA (Multi-head Linearized Attention) forward pass
+        """
+        bsz, q_len, _ = hidden_states.size()
+        
+        # 1. Query projection and split
+        q = self.q_up_proj(
+            self.q_down_layernorm(
+                self.q_down_proj(hidden_states)
+            )
+        )
+        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+        q_nope, q_pe = torch.split(
+            q,
+            [self.qk_nope_head_dim, self.qk_rope_head_dim],
+            dim=-1
+        )
+        
+        # 2. Key/Value projection and split
+        compressed_kv = self.kv_down_proj(hidden_states)
+        compressed_kv, k_pe = torch.split(
+            compressed_kv,
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1
+        )
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        kv = (
+            self.kv_up_proj(self.kv_down_layernorm(compressed_kv))
+            .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            .transpose(1, 2)
+        )
+        k_nope, value_states = torch.split(
+            kv,
+            [self.qk_nope_head_dim, self.v_head_dim],
+            dim=-1
+        )
 
-        self.kv_down = nn.Linear(config.hidden_size, config.kv_lora_rank + config.qk_rope_head_dim, bias=config.attention_bias)
-        self.kv_norm = RMSNorm(config.kv_lora_rank)
-        self.kv_up = nn.Linear(config.kv_lora_rank, config.num_heads * (config.qk_nope_head_dim + config.v_head_dim), bias=False)
+        # 3. Apply RoPE to position-dependent parts
+        kv_seq_len = value_states.shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
-        self.rotary_emb = RotaryEmbedding(config.qk_rope_head_dim, config.max_position_embeddings, config.rope_theta)
-        self.o_proj = nn.Linear(config.num_heads * config.v_head_dim, config.hidden_size, bias=config.attention_bias)
-        self.dropout = config.attention_dropout
+        # Final Q, K, V shapes should all be (batch_size, num_heads, seq_len, head_dim)
+        # Where q/k head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # v head_dim = self.v_head_dim
 
-    def forward(self, x, mask=None, pos_ids=None):
-        B, N, _ = x.size()
-        q = self.q_up(self.q_norm(self.q_down(x))).view(B, N, self.num_heads, -1).transpose(1, 2)
-        q_nope, q_pe = torch.split(q, [128, 64], dim=-1)
+        # 4. Combine position-dependent and independent parts
+        query_states = torch.empty(
+            bsz, self.num_heads, q_len, self.q_head_dim,
+            device=k_pe.device
+        )
+        query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
+        query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
 
-        kv = self.kv_down(x)
-        kv_content, k_pe = torch.split(kv, [512, 64], dim=-1)
-        k_pe = k_pe.view(B, N, 1, 64).transpose(1, 2)
-        kv_up = self.kv_up(self.kv_norm(kv_content)).view(B, N, self.num_heads, -1).transpose(1, 2)
-        k_nope, v = torch.split(kv_up, [128, 128], dim=-1)
+        key_states = torch.empty(
+            bsz, self.num_heads, q_len, self.q_head_dim,
+            device=k_pe.device
+        )
+        key_states[:, :, :, :self.qk_nope_head_dim] = k_nope
+        key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
 
-        cos, sin = self.rotary_emb(v, seq_len=N)
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, pos_ids)
+        # 5. Compute attention scores
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
+        attn_weights = attn_weights / math.sqrt(self.q_head_dim)
 
-        q_full = torch.cat([q_nope, q_pe], dim=-1)
-        k_full = torch.cat([k_nope, k_pe], dim=-1)
+        if attention_mask is not None:
+            attn_weights = torch.masked_fill(
+                attn_weights,
+                attention_mask == 0,
+                float("-inf"),
+            )
 
-        scores = torch.matmul(q_full, k_full.transpose(-1, -2)) / math.sqrt(self.q_head_dim)
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-        attn = F.dropout(F.softmax(scores, dim=-1, dtype=torch.float32), p=self.dropout, training=self.training)
+        # 6. Softmax and dropout
+        attn_weights = F.softmax(
+            attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(
+            attn_weights, p=self.attention_dropout, training=self.training)
 
-        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, N, -1)
-        return self.o_proj(out)
+        # 7. Compute attention output
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, attn_weights
